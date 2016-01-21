@@ -127,7 +127,7 @@ long DCoffset_V_long;                   // <--- for LPF
 long DCoffsetV_min;                     // <--- for LPF
 long DCoffsetV_max;                     // <--- for LPF
 long cumV_deltasThisCycle_long;         // for the LPF which determines DC offset (voltage)
-long lastSampleV_minusDC_long;          // for the phaseCal algorithm
+static long lastSampleV_minusDC_long;          // for the phaseCal algorithm
 int phaseCal_int_CT[max_no_of_channels];    // to avoid the need for floating-point maths
 int datalogPeriodInMainsCycles;
 
