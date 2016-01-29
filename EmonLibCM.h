@@ -55,6 +55,6 @@ extern volatile boolean datalogEventPending;
 
 extern bool EmonLibCM_ACAC;
 
-extern int EmonLibCM_Vrms;
+extern double EmonLibCM_Vrms;
 
 #endif

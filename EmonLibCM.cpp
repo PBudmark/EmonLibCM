@@ -51,7 +51,7 @@ double Irms_CT[max_no_of_channels];
 long wh_CT[max_no_of_channels];
 
 bool EmonLibCM_ACAC;
-int EmonLibCM_Vrms;
+double EmonLibCM_Vrms;
     
 // analogue ports
 static const byte voltageSensor = 0;                // <-- used as an input
@@ -122,11 +122,23 @@ double voltageCal = 0.85;
 // Some of these variables are used in multiple blocks so cannot be static.
 // For integer maths, many variables need to be 'long'
 static const byte startUpPeriod = 3;    // in seconds, to allow LP filter to settle
-static const int DCoffset_I = 512;      // nominal mid-point value of ADC @ x1 scale
+
+// LPF for current
+const long DCoffsetI_init = (512L * 256);
+const long DCoffsetI_min = DCoffsetI_init - (100L * 256);
+const long DCoffsetI_max = DCoffsetI_init + (100L * 256);
+
+long DCoffset_I_long_CT[max_no_of_channels];
+long cumI_deltasThisCycle_long_CT[max_no_of_channels]; // for the LPF which determines DC offset (current)
+
+// LPF for voltage
+const long DCoffsetV_init = (512L * 256);
+const long DCoffsetV_min = DCoffsetV_init - (100L * 256);
+const long DCoffsetV_max = DCoffsetV_init + (100L * 256);
+
 long DCoffset_V_long;                   // <--- for LPF
-long DCoffsetV_min;                     // <--- for LPF
-long DCoffsetV_max;                     // <--- for LPF
 long cumV_deltasThisCycle_long;         // for the LPF which determines DC offset (voltage)
+static long sampleV_minusDC_long;
 static long lastSampleV_minusDC_long;          // for the phaseCal algorithm
 int phaseCal_int_CT[max_no_of_channels];    // to avoid the need for floating-point maths
 int datalogPeriodInMainsCycles;
@@ -219,6 +231,9 @@ void EmonLibCM_Init()
         powerCal_CT[i] = voltageCal * currentCal[i];
     
         residualEnergy_CT[i] = 0;
+
+        DCoffset_I_long_CT[i] = DCoffsetI_init; // nominal mid-point value of ADC @ x256 scale
+        cumI_deltasThisCycle_long_CT[i] = 0;
         
         // When using integer maths, calibration values that have supplied in floating point 
         // form need to be rescaled.
@@ -229,14 +244,14 @@ void EmonLibCM_Init()
     // Define operating limits for the LP filters which identify DC offset in the voltage 
     // sample streams.  By limiting the output range, these filters always should start up 
     // correctly.
-    DCoffset_V_long = 512L * 256; // nominal mid-point value of ADC @ x256 scale
-    DCoffsetV_min = (long)(512L - 100) * 256; // mid-point of ADC minus a working margin
-    DCoffsetV_max = (long)(512L + 100) * 256; // mid-point of ADC minus a working margin
-
-    EmonLibCM_Start();
+    DCoffset_V_long = DCoffsetV_init; // nominal mid-point value of ADC @ x256 scale
+    sampleV_minusDC_long = 0;
+    cumV_deltasThisCycle_long = 0;
     
     datalogPeriodInMainsCycles = datalog_period_in_seconds * cycles_per_second;  
     datalogEventPending = false;
+
+    EmonLibCM_Start();
 }
 
 void EmonLibCM_Start()
@@ -376,7 +391,7 @@ void EmonLibCM_allGeneralProcessing_withinISR()
         lastCycle = millis();
         
         // Used in stop start opperation, discards the first partial cycle
-        if (cycleCountForDatalogging >= min_startup_cycles && firstcycle==true)
+        if ((cycleCountForDatalogging >= min_startup_cycles) && firstcycle==true)
         {
             firstcycle = false;
             cycleCountForDatalogging = 0;
@@ -390,20 +405,18 @@ void EmonLibCM_allGeneralProcessing_withinISR()
         }
         
         
-        if (cycleCountForDatalogging  >= datalogPeriodInMainsCycles && firstcycle==false) 
+        if ((cycleCountForDatalogging  >= datalogPeriodInMainsCycles) && firstcycle==false) 
         { 
           cycleCountForDatalogging = 0;    
           for (int i=0; i<no_of_channels; i++) {
             copyOf_sumP_CT[i] = sumP_CT[i]; 
             copyOf_sumI_CT[i] = sumI_CT[i]; 
+            sumP_CT[i] = 0;
+            sumI_CT[i] = 0;
           }
           copyOf_sum_Vsquared = sum_Vsquared;
           copyOf_samplesDuringThisDatalogPeriod = samplesDuringThisDatalogPeriod;
           copyOf_lowestNoOfSampleSetsPerMainsCycle = lowestNoOfSampleSetsPerMainsCycle; // (for diags only)
-          for (int i=0; i<no_of_channels; i++) {
-            sumP_CT[i] = 0;
-            sumI_CT[i] = 0;
-          }
           sum_Vsquared = 0;
           lowestNoOfSampleSetsPerMainsCycle = 999;
           samplesDuringThisDatalogPeriod = 0;
@@ -436,11 +449,27 @@ void EmonLibCM_allGeneralProcessing_withinISR()
       // sketches of this type.
       //
       if (DCoffset_V_long < DCoffsetV_min) {  // for voltage source V
-        DCoffset_V_long = DCoffsetV_min; }
+        DCoffset_V_long = DCoffsetV_min; 
+      }
       else  
       if (DCoffset_V_long > DCoffsetV_max) {
-        DCoffset_V_long = DCoffsetV_max; }
+        DCoffset_V_long = DCoffsetV_max; 
+      }
         
+      // Update all Low Pass Filters for DC-offset removal in current channels
+      for (int i=0; i<no_of_channels; i++)
+      {
+          DCoffset_I_long_CT[i] += (cumI_deltasThisCycle_long_CT[i]>>6); // faster than * 0.01
+
+          if (DCoffset_I_long_CT[i] < DCoffsetI_min) {
+              DCoffset_I_long_CT[i] = DCoffsetI_min;
+          }
+          else if (DCoffset_I_long_CT[i] > DCoffsetI_max) {
+              DCoffset_I_long_CT[i] = DCoffsetI_max;
+          }
+
+          cumI_deltasThisCycle_long_CT[i] = 0;
+      }
       // check_RF_LED_status();       
                 
     } // end of processing that is specific to the first Vsample in each -ve half cycle
@@ -452,7 +481,7 @@ void EmonLibCM_allGeneralProcessing_withinISR()
   
   unsigned long missing_cycles = (millis() - lastCycle) / (1000 / cycles_per_second);
   
-  if (missing_cycles > datalogPeriodInMainsCycles) {
+  if (missing_cycles > (unsigned long)datalogPeriodInMainsCycles) {
     lastCycle = millis(); // reset the lastCycle count here.
     firstcycle = true;    // firstcycle reset to true so that next reading
                           // with voltage signal starts from the right place
@@ -499,16 +528,15 @@ void EmonLibCM_interrupt()
 {                                         
   static unsigned char sample_index = 0;
   unsigned char next = 0;
-  static  long sampleV_minusDC_long;
   int rawSample;
   long filtV_div4;
   long filtI_div4;
   long instP;
   long inst_Vsquared;
   long inst_Isquared;
-  long sampleIminusDC_long;
+  long sampleI_minusDC_long;
   long phaseShiftedSampleV_minusDC_long;
-  
+
   rawSample = ADC;
   
   next = sample_index + 2;
@@ -517,6 +545,7 @@ void EmonLibCM_interrupt()
   
   if (sample_index==0)
   {
+      lastSampleV_minusDC_long = sampleV_minusDC_long;  // required for phaseCal algorithm  
       // remove DC offset from the raw voltage sample by subtracting the accurate value 
       // as determined by a LP filter.
       sampleV_minusDC_long = ((long)rawSample<<8) - DCoffset_V_long;
@@ -542,33 +571,35 @@ void EmonLibCM_interrupt()
       //
       // store items for later use
       cumV_deltasThisCycle_long += sampleV_minusDC_long; // for use with LP filter
-      lastSampleV_minusDC_long = sampleV_minusDC_long;  // required for phaseCal algorithm  
       polarityConfirmedOfLastSampleV = polarityConfirmed;  // for identification of half cycle boundaries
   }
   
   if (sample_index>=1 && sample_index <= no_of_channels)
   {
       if (rawSample>10) {
-      // remove most of the DC offset from the current sample (the precise value does not matter)
-      sampleIminusDC_long = ((long)(rawSample - DCoffset_I))<<8;
-      
-      // phase-shift the voltage waveform so that it aligns with the current 
-      //phaseShiftedSampleV_minusDC_long = sampleV_minusDC_long;
-      phaseShiftedSampleV_minusDC_long = lastSampleV_minusDC_long
-         + (((sampleV_minusDC_long - lastSampleV_minusDC_long)*phaseCal_int_CT[sample_index-1])>>8);  
-      
-      // calculate the "real power" in this sample pair and add to the accumulated sum
-      filtV_div4 = phaseShiftedSampleV_minusDC_long>>2;  // reduce to 16-bits (now x64, or 2^6)
-      filtI_div4 = sampleIminusDC_long>>2; // reduce to 16-bits (now x64, or 2^6)
-      instP = filtV_div4 * filtI_div4;  // 32-bits (now x4096, or 2^12)
-      instP = instP>>12;     // scaling is now x1, as for Mk2 (V_ADC x I_ADC)  
-      
-      inst_Isquared = filtI_div4 * filtI_div4;
-      inst_Isquared = inst_Isquared>>12;
-      sumI_CT[sample_index-1] += inst_Isquared;
-      
-      // if (sample_CT4==0) instP_CT4 = 0;  
-      sumP_CT[sample_index-1] +=instP; // cumulative power, scaling as for Mk2 (V_ADC x I_ADC)
+          // remove most of the DC offset from the current sample
+          sampleI_minusDC_long = ((long)rawSample<<8) - DCoffset_I_long_CT[sample_index-1];
+          
+          // phase-shift the voltage waveform so that it aligns with the current 
+          //phaseShiftedSampleV_minusDC_long = sampleV_minusDC_long;
+          phaseShiftedSampleV_minusDC_long = lastSampleV_minusDC_long
+             + (((sampleV_minusDC_long - lastSampleV_minusDC_long)*phaseCal_int_CT[sample_index-1])>>8);  
+          
+          // calculate the "real power" in this sample pair and add to the accumulated sum
+          filtV_div4 = phaseShiftedSampleV_minusDC_long>>2;  // reduce to 16-bits (now x64, or 2^6)
+          filtI_div4 = sampleI_minusDC_long>>2; // reduce to 16-bits (now x64, or 2^6)
+          instP = filtV_div4 * filtI_div4;  // 32-bits (now x4096, or 2^12)
+          instP = instP>>12;     // scaling is now x1, as for Mk2 (V_ADC x I_ADC)  
+          
+          inst_Isquared = filtI_div4 * filtI_div4;
+          inst_Isquared = inst_Isquared>>12;
+          sumI_CT[sample_index-1] += inst_Isquared;
+          
+          // if (sample_CT4==0) instP_CT4 = 0;  
+          sumP_CT[sample_index-1] +=instP; // cumulative power, scaling as for Mk2 (V_ADC x I_ADC)
+
+          // store items for later use
+          cumI_deltasThisCycle_long_CT[sample_index-1] += sampleI_minusDC_long; // for use with LP filter
       }
   }
   
